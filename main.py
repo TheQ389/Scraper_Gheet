@@ -17,6 +17,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 import json
 import socket
 import psutil  # pip install psutil — đo RAM thực tế
+import sys
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 socket.setdefaulttimeout(60)
@@ -25,7 +26,7 @@ socket.setdefaulttimeout(60)
 # CẤU HÌNH DỰ ÁN
 # ==========================================
 PROJECT_NAME  = "ScrapMap"
-VERSION       = "6.5 - Live Sync Filter (Cập nhật Blacklist tức thì)"
+VERSION       = "6.6 - Auto Update Check (Tự động kiểm tra phiên bản)"
 CREDENTIALS_FILE = "credentials.json"
 SHEET_ID      = "1fRPPqaQ30wwcnRoZ0_vadEGQonfbYFFMIjFyBOHNsHA"
 BATCH_SIZE    = 20
@@ -33,6 +34,9 @@ MEMORY_LIMIT_MB      = 1200   # Khởi động lại Chrome khi RAM process vư�
 MAX_ROWS_PER_TAB     = 50000
 LOCK_TIMEOUT_SEC     = 600    # 10 phút
 N8N_WEBHOOK_URL      = "https://driver.flowhost.vn/webhook/scraper_map_notify_n8n"
+
+# ĐƯỜNG DẪN CẬP NHẬT (GITHUB RAW)
+UPDATE_URL = "https://raw.githubusercontent.com/TheQ389/Scraper_Gheet/refs/heads/main/main.py"
 
 # --- CSS SELECTORS ---
 LINK_SELECTOR     = "a.hfpxzc"
@@ -170,6 +174,24 @@ class GSheetScraper:
     def _should_restart_browser(self) -> bool:
         return get_process_memory_mb() > MEMORY_LIMIT_MB
 
+    def _check_for_update(self):
+        """Kiểm tra xem trên GitHub có phiên bản VERSION mới hơn không"""
+        try:
+            self.log("🔍 Đang kiểm tra cập nhật trên GitHub...")
+            resp = requests.get(UPDATE_URL, timeout=10)
+            if resp.status_code == 200:
+                # Tìm dòng VERSION = "..." bằng Regex
+                match = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', resp.text)
+                if match:
+                    remote_version = match.group(1)
+                    if remote_version != VERSION:
+                        self.log(f"🆙 Phát hiện phiên bản mới: {remote_version}. Đang chuẩn bị restart để cập nhật...")
+                        return True
+            return False
+        except Exception as e:
+            self.log(f"⚠️ Không thể kiểm tra cập nhật: {e}")
+            return False
+
     def connect_sheet(self):
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
@@ -227,7 +249,6 @@ class GSheetScraper:
                 kw_row = kw_index + 2
                 kw = kw_data[0]
                 
-                # Logic xác định cột Trạng thái & Blacklist động
                 col_b = str(kw_data[1]).strip() if len(kw_data) > 1 else ""
                 col_c = str(kw_data[2]).strip() if len(kw_data) > 2 else ""
                 is_new_form = col_b.lower() not in ["done", "running...", "error", ""]
@@ -238,7 +259,6 @@ class GSheetScraper:
                 self.log(f"🔥 Từ khóa: {kw}")
 
                 while True:
-                    # Đọc lại địa điểm
                     try: locations = self._api_retry(self.ws_loc.get_all_values)[1:]
                     except: time.sleep(5); continue
 
@@ -254,9 +274,7 @@ class GSheetScraper:
                             else: other_running = True
 
                     if target_row != -1:
-                        # --- LIVE SYNC BLACKLIST: Đọc lại Blacklist từ Sheet ngay trước khi cào ---
                         try:
-                            # Đọc đúng dòng hiện tại của từ khóa để lấy Blacklist mới nhất
                             latest_kw_row = self._api_retry(self.ws_kw.row_values, kw_row)
                             raw_bl = latest_kw_row[1] if is_new_form else ""
                             current_blacklist = [w.strip().lower() for w in raw_bl.split(',') if w.strip()]
@@ -300,7 +318,8 @@ class GSheetScraper:
                                         if len(all_urls) >= limit_per_location: break
                                         self.driver.execute_script("arguments[0].scrollTo(0, arguments[0].scrollHeight);", scroll_pane)
                                         time.sleep(3.5)
-                                        new_h = self.driver.execute_script("return arguments[0].scrollHeight", scroll_pane); if new_h == last_h: break 
+                                        new_h = self.driver.execute_script("return arguments[0].scrollHeight", scroll_pane)
+                                        if new_h == last_h: break 
                                         last_h = new_h
 
                             for url in all_urls[:limit_per_location]:
@@ -313,7 +332,6 @@ class GSheetScraper:
                                     self.processed_urls.add(url)
                                     name = safe_get_text(self.driver, TITLE_SELECTOR)
                                     cat = safe_get_text(self.driver, CATEGORY_SELECTOR)
-                                    # Lọc rác real-time
                                     if any(w in cat.lower() or w in name.lower() for w in current_blacklist): continue
 
                                     addr = safe_get_text(self.driver, ADDRESS_SELECTOR, attr="aria-label").replace("Địa chỉ: ", "").strip() or f"{phuong}, {quan}, {tinh}"
@@ -321,7 +339,8 @@ class GSheetScraper:
                                     web = safe_get_text(self.driver, WEB_SELECTOR, attr="href").split("?")[0]
                                     rating = ""
                                     for r_css in RATING_SELECTORS:
-                                        rt = safe_get_text(self.driver, r_css); if rt: rating = rt; break
+                                        rt = safe_get_text(self.driver, r_css)
+                                        if rt: rating = rt; break
                                     p_clean, p_type = classify_phone(p_raw)
                                     if p_clean and p_clean in self.processed_phones: continue
                                     if p_clean: self.processed_phones.add(p_clean)
@@ -333,9 +352,19 @@ class GSheetScraper:
                             self.flush_batch(force=True)
                         except: self.update_cell(self.ws_loc, target_row, 4, "Error"); continue
                         
-                        try:
-                            if self._should_restart_browser(): self.setup_browser()
-                        except: pass
+                        # --- KIỂM TRA RAM VÀ CẬP NHẬT PHIÊN BẢN ---
+                        self.search_count += 1
+                        if self._should_restart_browser() or self.search_count >= 30:
+                            # Trước khi restart browser, kiểm tra xem có bản code mới trên GitHub không
+                            if self._check_for_update():
+                                self.log("🚀 Đang đóng máy để launcher cập nhật lên bản mới...")
+                                if self.driver: self.driver.quit()
+                                sys.exit(0) # Thoát hẳn để launcher.py làm nhiệm vụ update
+                            
+                            self.log("♻️ Giải phóng RAM định kỳ...")
+                            self.setup_browser()
+                            self.search_count = 0
+
                     elif other_running: time.sleep(30)
                     else: break
 
